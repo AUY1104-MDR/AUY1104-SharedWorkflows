@@ -1,24 +1,57 @@
-name: Run Hello World and LS
+name: Subir API a Docker Hub
 
 on:
-  push:
-  workflow_dispatch:
   workflow_call:
-    secrets: 
-      DOCKER_USERNAME: 
+    inputs:
+      image-name:
+        description: Cómo se llamará nuestra imagen en Docker Hub (solo nombre, sin el usuario)
+        required: true
+        type: string
+      image-tag:
+        description: Etiqueta que identifica esta versión (Ej. identificador del commit)
+        required: true
+        type: string
+    secrets:
+      DOCKER_USERNAME:
         required: true
       DOCKER_PASSWORD:
         required: true
 
+  workflow_dispatch:
+    inputs:
+      image-name:
+        description: Nombre corto de la imagen (ej. mi-api-academica)
+        required: true
+        type: string
+      image-tag:
+        description: Etiqueta de esta version (ej. v1.0.0)
+        required: true
+        type: string
 
 jobs:
-  run-inline-script:
+# Paso1: Instalación de dependencias y ejecución de test
+  deps-and-test:
+    name: Dependencies and tests
     runs-on: ubuntu-latest
     steps:
+      - name: 1 · Descargar el código del repositorio
+        uses: actions/checkout@v4
 
-      #  1. Checout del código
+      - name: 2 · Instalar dependencias
+        uses: npm install
 
-      - name: Checkout
+      - name: 3 · Ejecutar test
+        run: npm install
+
+  #Paso 2: Ejecución solo si el paso anterior terminó bien
+  build-and-push:
+    name: Build and push docker image
+    needs: deps-and-test
+    runs-on: ubuntu-latest
+      steps:
+
+      #  1. Checkout del código que se encuentra en GitHub a la máquina temporal del WF
+      - name: 1 - Descargar el código del repositorio
         uses: actions/checkout@v4
 
       #  2. Credenciales de Docker Hub
@@ -27,3 +60,17 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+      # 3. Construir la imagen de la app y subir todas las etiquetas
+      - name: 3 - Armar la imagen y publicarla
+        run: |
+          #Nombre completo en Docker Hub: usuario/nombre-de-la-imagen
+          IMAGEN_COMPLETA="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
+          
+          #Una sola construcción, dos etiquetas: la de esta versión y "latest"
+          docker build \
+            -t "${IMAGEN_COMPLETA}:${{ inputs.image-tag }}" \
+            -t "${IMAGEN_COMPLETA}:latest" \
+          .
+          
+          #Sube a Docker Hub todas las etiquetas que acabamos de crear para esta imagen
+          docker push --all-tags "${IMAGEN_COMPLETA}"
