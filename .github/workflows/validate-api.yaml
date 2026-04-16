@@ -1,0 +1,33 @@
+# Receta compartida: validar en CI (tests + build Docker) sin publicar en ningún registry.
+# Pensada para dispararse desde el repositorio cliente en pushes a ramas de trabajo.
+
+name: Validar API en CI (sin publicar)
+
+on:
+  workflow_call:
+
+jobs:
+  deps-and-test:
+    name: Dependencies and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 · Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: 2 · Instalar dependencias
+        run: npm install
+
+      - name: 3 · Ejecutar tests
+        run: npm test
+
+  docker-build-only:
+    name: Build Docker image (solo validación)
+    needs: deps-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 · Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: 2 · Construir imagen localmente (sin publicar)
+        run: |
+          docker build -t "app-ci:${{ github.sha }}" .
