@@ -1,31 +1,64 @@
 # ─────────────────────────────────────────────────────────────
-# Receta compartida: “empaquetar la app y dejarla en Docker Hub”
-# Otros repositorios pueden llamarla sin copiar todo el script.
+# EFT · Plantilla reutilizable consolidada: Build + Deploy Blue-Green
+#
+# Etapas de CI (Build):
+#   1. Instalar dependencias y ejecutar tests (fail fast).
+#   2. Construir la imagen Docker y publicarla en Docker Hub con
+#      doble etiqueta (versión + latest).
+#
+# Etapa de CD (Deploy Blue-Green sobre K3s):
+#   3. Detecta el color activo leyendo el selector del Service principal.
+#   4. Despliega la nueva versión en el color opuesto (entorno "candidato"),
+#      inyectando variables de entorno dinámicas enviadas por el repo cliente.
+#   5. Valida la salud del candidato a través de su Service de preview,
+#      SIN haber movido el tráfico de producción.
+#   6. Solo si la validación pasa, conmuta el selector del Service principal
+#      (switch de tráfico 100%) y vuelve a validar en el puerto de producción.
+#   7. Ante cualquier fallo (rollout, salud pre-switch o post-switch), el paso
+#      de rollback automático repone el selector en el color estable y apaga
+#      el candidato: el tráfico nunca queda apuntando a una versión enferma.
+#
+# Convenciones esperadas en el repo cliente (carpeta k8s/):
+#   - deployment.template.yml  → usa ${APP_NAME}, ${COLOR}, ${IMAGE} (envsubst)
+#   - service.yml              → Service principal (selector app+color)
+#   - service-preview-blue.yml / service-preview-green.yml → NodePort por color
 # ─────────────────────────────────────────────────────────────
 
-name: Subir la API a Docker Hub (receta reutilizable)
+name: Build + Deploy Blue-Green sobre K3s (plantilla reutilizable)
 
 on:
-  # Los repos cliente pasan la IP K3S como input (no hay acceso a vars del caller desde aquí).
-  # Ejemplo en el cliente: with: k3s-server-public-ip: ${{ vars.K3S_SERVER_PUBLIC_IP }}
-  #
-  # Cuando otro repo te “llama” y te pasa nombre de imagen, tag y secretos
   workflow_call:
     inputs:
       image-name:
-        description: Cómo se llamará la imagen en Docker Hub (solo el nombre, sin tu usuario)
+        description: Nombre de la imagen en Docker Hub (sin el usuario)
         required: true
         type: string
       image-tag:
-        description: Etiqueta que identifica esta versión (por ejemplo el identificador del commit)
+        description: Etiqueta de la versión a construir y desplegar
         required: true
         type: string
+      app-name:
+        description: Nombre base de la app (Deployments <app>-blue/<app>-green y Services)
+        required: false
+        type: string
+        default: techmarket-orders
       k3s-server-public-ip:
-        description: >
-          IP pública del servidor K3S. En el repo cliente suele guardarse como variable
-          de repositorio (p. ej. K3S_SERVER_PUBLIC_IP) y pasarse en el bloque with del uses.
+        description: IP pública del servidor K3s (variable de repo del cliente)
         required: true
         type: string
+      env-vars:
+        description: >
+          Variables de entorno dinámicas para el clúster, una por línea con
+          formato CLAVE=VALOR. Se inyectan al Deployment candidato con
+          "kubectl set env" antes de esperar el rollout.
+        required: false
+        type: string
+        default: ""
+      health-path:
+        description: Ruta HTTP usada para la validación de salud
+        required: false
+        type: string
+        default: /health
     secrets:
       DOCKER_USERNAME:
         required: true
@@ -33,24 +66,9 @@ on:
         required: true
       EA2_SSH_PRIVATE_KEY:
         required: true
-  # Ejecución manual desde GitHub → Actions → Run workflow (mismos inputs que vía workflow_call)
-  workflow_dispatch:
-    inputs:
-      image-name:
-        description: Nombre corto de la imagen (ej. mi-api-academica)
-        required: true
-        type: string
-      image-tag:
-        description: Etiqueta de esta versión (ej. v1.0.0)
-        required: true
-        type: string
-      k3s-server-public-ip:
-        description: IP pública del servidor K3S (si corres este workflow aquí, pulsa el valor; vía workflow_call suele inyectarse desde vars del repo app).
-        required: true
-        type: string
 
 jobs:
-  # Etapa 1 · Instalar dependencias y ejecutar tests (si falla, no se construye ni publica la imagen)
+  # Etapa 1 · Si los tests fallan, la imagen no se construye ni publica (fail fast)
   deps-and-test:
     name: Dependencies and tests
     runs-on: ubuntu-latest
@@ -70,77 +88,206 @@ jobs:
     needs: deps-and-test
     runs-on: ubuntu-latest
     steps:
-      # Paso 1 · Traer el código que está en GitHub a la máquina temporal del workflow
       - name: 1 · Descargar el código del repositorio
         uses: actions/checkout@v4
 
-      # Paso 2 · Decirle a Docker “soy yo” usando usuario y contraseña/token guardados en secretos
       - name: 2 · Iniciar sesión en Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # Paso 3 · Construir la “foto” de la app y subir todas las etiquetas que creamos abajo
-      - name: 3 · Armar la imagen y publicarla
+      - name: 3 · Construir la imagen y publicarla
         run: |
-          # Nombre completo en Docker Hub: tu-usuario/nombre-de-la-imagen
           IMAGEN_COMPLETA="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
 
-          # Una sola construcción, dos etiquetas: la de esta versión y "latest" (la última)
           docker build \
             -t "${IMAGEN_COMPLETA}:${{ inputs.image-tag }}" \
             -t "${IMAGEN_COMPLETA}:latest" \
             .
 
-          # Sube al Hub todas las etiquetas que acabamos de crear para esta imagen
           docker push --all-tags "${IMAGEN_COMPLETA}"
 
-  deploy-to-k8s:
-    name: Deploy to AWS K3S
+  # Etapa 3 · Deploy Blue-Green: solo corre si la imagen quedó publicada
+  blue-green-deploy:
+    name: Blue-Green deploy to AWS K3s
     needs: build-and-push
     runs-on: ubuntu-latest
+    env:
+      APP: ${{ inputs.app-name }}
+      HOST: ubuntu@${{ inputs.k3s-server-public-ip }}
+      SSH_OPTS: -o StrictHostKeyChecking=accept-new
     steps:
+      - name: Checkout (manifiestos K8s del repo cliente)
+        uses: actions/checkout@v4
+
       - uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
 
-      - name: 1 · SSH al servidor K3S
-        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'echo ok'
+      - name: 1 · Verificar acceso SSH al servidor K3s
+        run: ssh $SSH_OPTS "$HOST" 'echo ok'
 
-      # Manifiestos viven en el repo que invoca este workflow (ej. k8s/demo.yaml)
-      - name: Checkout (manifiestos K8s)
-        uses: actions/checkout@v4
-
-      - name: 2 · Copiar k8s/ al servidor
+      # Lee el selector del Service principal para saber qué color recibe el
+      # tráfico hoy. Si el Service no existe aún, es el primer despliegue.
+      - name: 2 · Determinar color activo y color objetivo
+        id: colors
         run: |
           set -euo pipefail
-          test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo rm -rf /tmp/k8s-deploy'
-          scp -o StrictHostKeyChecking=accept-new -r k8s "ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy"
+          ACTIVE=$(ssh $SSH_OPTS "$HOST" \
+            "sudo k3s kubectl get svc ${APP} -o jsonpath='{.spec.selector.color}' 2>/dev/null" || true)
+          if [ -z "$ACTIVE" ]; then
+            TARGET=blue
+            echo "Primer despliegue: no existe Service ${APP}; el objetivo es '${TARGET}'."
+          elif [ "$ACTIVE" = "blue" ]; then
+            TARGET=green
+          else
+            TARGET=blue
+          fi
+          echo "Color activo: '${ACTIVE:-ninguno}' → color objetivo: '${TARGET}'"
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
 
-      # Aplica los manifiestos y espera a que el rollout termine. Si los pods no
-      # quedan listos antes del timeout, este paso falla y dispara el rollback.
-      - name: Deploy to k3s
-        id: deploy
+      # Renderiza el template del Deployment con el color objetivo y la imagen
+      # de esta versión. El template vive en el repo cliente (k8s/).
+      - name: 3 · Renderizar manifiesto del color objetivo
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
         run: |
           set -euo pipefail
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl apply -f /tmp/k8s-deploy/'
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl rollout status deployment/demo-api --timeout=60s'
+          test -f k8s/deployment.template.yml || { echo "::error::Falta k8s/deployment.template.yml"; exit 1; }
+          export APP_NAME="${APP}"
+          export IMAGE="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }}"
+          export COLOR
+          envsubst '${APP_NAME} ${IMAGE} ${COLOR}' \
+            < k8s/deployment.template.yml > "/tmp/deployment-${COLOR}.yml"
+          echo "── Manifiesto renderizado ──"
+          cat "/tmp/deployment-${COLOR}.yml"
 
-      # Solo se ejecuta si el paso anterior falló (rollout status sin éxito).
-      # Revierte a la última revisión estable y vuelve a verificar el rollout.
+      - name: 4 · Copiar manifiestos al servidor
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "$HOST" 'sudo rm -rf /tmp/k8s-deploy && mkdir -p /tmp/k8s-deploy'
+          scp $SSH_OPTS "/tmp/deployment-${COLOR}.yml" k8s/service.yml \
+            k8s/service-preview-blue.yml k8s/service-preview-green.yml \
+            "$HOST:/tmp/k8s-deploy/"
+
+      # Aplica el Deployment candidato y los Services de preview. El Service
+      # principal SOLO se aplica en el primer despliegue: en los siguientes se
+      # gestiona vía patch, para no pisar el selector activo.
+      - name: 5 · Aplicar Deployment candidato y Services
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+          ACTIVE: ${{ steps.colors.outputs.active }}
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "$HOST" "sudo k3s kubectl apply -f /tmp/k8s-deploy/deployment-${COLOR}.yml"
+          ssh $SSH_OPTS "$HOST" 'sudo k3s kubectl apply -f /tmp/k8s-deploy/service-preview-blue.yml -f /tmp/k8s-deploy/service-preview-green.yml'
+          if [ -z "$ACTIVE" ]; then
+            ssh $SSH_OPTS "$HOST" 'sudo k3s kubectl apply -f /tmp/k8s-deploy/service.yml'
+          fi
+
+      # Ítem 1 · Inyección de variables de entorno dinámicas al clúster:
+      # el repo cliente decide qué variables enviar en cada despliegue.
+      - name: 6 · Inyectar variables de entorno dinámicas
+        if: inputs.env-vars != ''
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+          ENV_VARS: ${{ inputs.env-vars }}
+        run: |
+          set -euo pipefail
+          VARS=$(echo "$ENV_VARS" | grep -v '^\s*$' | tr '\n' ' ')
+          echo "Variables a inyectar en ${APP}-${COLOR}: $VARS"
+          ssh $SSH_OPTS "$HOST" "sudo k3s kubectl set env deployment/${APP}-${COLOR} $VARS"
+
+      - name: 7 · Esperar rollout del candidato
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "$HOST" \
+            "sudo k3s kubectl rollout status deployment/${APP}-${COLOR} --timeout=120s"
+
+      # Validación de salud del candidato por su Service de preview, ANTES de
+      # mover el tráfico. Verifica además que quien responde es el color
+      # objetivo (la app expone DEPLOY_COLOR en el payload de /health).
+      - name: 8 · Validación de salud (pre-switch, tráfico intacto)
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+        run: |
+          set -euo pipefail
+          PORT=$(ssh $SSH_OPTS "$HOST" \
+            "sudo k3s kubectl get svc ${APP}-preview-${COLOR} -o jsonpath='{.spec.ports[0].nodePort}'")
+          URL="http://${{ inputs.k3s-server-public-ip }}:${PORT}${{ inputs.health-path }}"
+          echo "Validando candidato '${COLOR}' en ${URL}"
+          for i in $(seq 1 6); do
+            RESP=$(curl -fsS --max-time 5 "$URL" || true)
+            echo "Intento $i → ${RESP:-sin respuesta}"
+            if echo "$RESP" | grep -q '"ok":true' && echo "$RESP" | grep -q "\"color\":\"${COLOR}\""; then
+              echo "Candidato sano: responde ok y con el color esperado."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::El candidato '${COLOR}' no superó la validación de salud; el tráfico NO se conmuta."
+          exit 1
+
+      # Switch de tráfico 100%: recién aquí producción pasa a apuntar al
+      # color objetivo, manipulando el selector del Service (Ítem 2).
+      - name: 9 · Conmutar tráfico al color objetivo
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "$HOST" \
+            "sudo k3s kubectl patch svc ${APP} --type merge -p '{\"spec\":{\"selector\":{\"app\":\"${APP}\",\"color\":\"${COLOR}\"}}}'"
+          echo "Service ${APP} ahora apunta a color '${COLOR}'."
+
+      - name: 10 · Validación post-switch en producción
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+        run: |
+          set -euo pipefail
+          PORT=$(ssh $SSH_OPTS "$HOST" \
+            "sudo k3s kubectl get svc ${APP} -o jsonpath='{.spec.ports[0].nodePort}'")
+          URL="http://${{ inputs.k3s-server-public-ip }}:${PORT}${{ inputs.health-path }}"
+          for i in $(seq 1 3); do
+            RESP=$(curl -fsS --max-time 5 "$URL" || true)
+            echo "Intento $i → ${RESP:-sin respuesta}"
+            if echo "$RESP" | grep -q '"ok":true' && echo "$RESP" | grep -q "\"color\":\"${COLOR}\""; then
+              echo "Producción responde con la nueva versión ('${COLOR}')."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Producción no responde sano tras el switch; se activa el rollback."
+          exit 1
+
+      # Ítem 3 · Remediación automática: se ejecuta solo si algún paso previo
+      # falló. Repone el selector en el color estable (si existía) y apaga el
+      # candidato. La versión anterior sigue corriendo intacta.
       - name: Rollback automático
         if: failure()
+        env:
+          COLOR: ${{ steps.colors.outputs.target }}
+          ACTIVE: ${{ steps.colors.outputs.active }}
         run: |
           set -euo pipefail
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl rollout undo deployment/demo-api'
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl rollout status deployment/demo-api --timeout=60s'
+          if [ -n "$ACTIVE" ]; then
+            echo "Reponiendo el tráfico en el color estable '${ACTIVE}'..."
+            ssh $SSH_OPTS "$HOST" \
+              "sudo k3s kubectl patch svc ${APP} --type merge -p '{\"spec\":{\"selector\":{\"app\":\"${APP}\",\"color\":\"${ACTIVE}\"}}}'" || true
+          else
+            echo "Primer despliegue fallido: no hay color estable al cual volver."
+          fi
+          echo "Apagando el candidato '${COLOR}' (replicas=0)..."
+          ssh $SSH_OPTS "$HOST" \
+            "sudo k3s kubectl scale deployment/${APP}-${COLOR} --replicas=0" || true
+          echo "Rollback completado: el tráfico quedó en la última versión estable."
 
-      - name: Verificar pods
+      - name: Estado final del clúster
         if: always()
-        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo k3s kubectl get pods -o wide'
+        run: |
+          ssh $SSH_OPTS "$HOST" "sudo k3s kubectl get deploy,svc,pods -o wide -l app=${APP}"
